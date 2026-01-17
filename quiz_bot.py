@@ -214,8 +214,18 @@ def handle_poll_answer(poll):
     if uid not in users:
         return
 
-    if poll.option_ids[0] == poll.correct_option_id:
-        users[uid]["score"] += 1
+    u = users[uid]
+
+    poll_id = poll.poll_id
+    chosen = poll.option_ids[0]
+
+    correct = u.get("polls", {}).get(poll_id)
+
+    if correct is None:
+        return
+
+    if chosen == correct:
+        u["score"] += 1
 
 # ================= FINISH =================
 def finish(uid):
@@ -274,3 +284,4 @@ def rating(call):
 
 # ================= RUN =================
 bot.polling(none_stop=True, timeout=60, long_polling_timeout=60)
+
