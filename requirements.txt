@@ -1,2 +1,2 @@
-pyTelegramBotAPI
-PyPDF2
+pyTelegramBotAPI==4.15.4
+PyPDF2==3.0.1
