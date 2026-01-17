@@ -2,6 +2,7 @@ import telebot
 from telebot import types
 import sqlite3
 import os
+import random
 from PyPDF2 import PdfReader
 
 TOKEN = "8492824131:AAGnhTLsUbIfgxF9HpfB-zMxWQALLoKZ20Y"
@@ -43,22 +44,19 @@ db.commit()
 
 users = {}
 
+QUESTION_TIME = 20  # ⏱ HAR BIR SAVOL UCHUN VAQT (soniya)
+
 # ================= START =================
 @bot.message_handler(commands=["start"])
 def start(msg):
     args = msg.text.split()
 
-    # link orqali test
     if len(args) > 1 and args[1].startswith("test_"):
         start_test(msg.chat.id, msg.from_user, int(args[1].split("_")[1]))
         return
 
     users[msg.chat.id] = {"stage": "title"}
-    bot.send_message(
-        msg.chat.id,
-        "📝 Test nomini yuboring:\n"
-        "❗ Keyingi bosqichda PDF yuklaysiz"
-    )
+    bot.send_message(msg.chat.id, "📝 Test nomini yuboring:")
 
 # ================= TEXT =================
 @bot.message_handler(content_types=["text"])
@@ -78,7 +76,7 @@ def text_handler(msg):
         bot.send_message(
             uid,
             "📄 Endi PDF faylni yuboring\n"
-            "❗ Har savolda A–D va bitta * bo‘lishi shart"
+            "❗ Har savolda A–D variant va bitta * bo‘lishi shart"
         )
 
 # ================= PDF LOADER =================
@@ -99,9 +97,8 @@ def load_pdf(msg):
 
     full_text = ""
     for page in reader.pages:
-        text = page.extract_text()
-        if text:
-            full_text += text + "\n"
+        if page.extract_text():
+            full_text += page.extract_text() + "\n"
 
     lines = [l.strip() for l in full_text.splitlines() if l.strip()]
 
@@ -113,20 +110,17 @@ def load_pdf(msg):
     correct = None
 
     for t in lines:
-        # SAVOL
         if t[0].isdigit():
             q_text = t
             opts = []
             correct = None
 
-        # VARIANTLAR
         elif t[:2] in ("A)", "B)", "C)", "D)"):
             if "*" in t:
                 correct = len(opts)
                 t = t.replace("*", "")
             opts.append(t[3:].strip())
 
-        # SAQLASH SHARTI
         if q_text and correct is not None and len(opts) >= 4:
             sql.execute(
                 "INSERT INTO questions(test_id,text,correct) VALUES(?,?,?)",
@@ -145,13 +139,7 @@ def load_pdf(msg):
             q_text = None
 
     link = f"https://t.me/{bot.get_me().username}?start=test_{test_id}"
-
-    bot.send_message(
-        uid,
-        f"✅ PDF yuklandi\n"
-        f"📌 Saqlangan savollar: {saved}\n"
-        f"🔗 Test link:\n{link}"
-    )
+    bot.send_message(uid, f"✅ Test tayyor\n📌 Savollar: {saved}\n🔗 {link}")
 
     del users[uid]
 
@@ -167,10 +155,11 @@ def start_test(uid, user, tid):
         "test": tid,
         "index": 0,
         "score": 0,
+        "polls": {},
         "username": user.username or user.first_name
     }
 
-    bot.send_message(uid, f"🧠 Test: {t[0]}")
+    bot.send_message(uid, f"🧠 Test: {t[0]}\n⏱ Har savolga {QUESTION_TIME} soniya")
     send_question(uid)
 
 def send_question(uid):
@@ -190,24 +179,26 @@ def send_question(uid):
     sql.execute("SELECT text FROM options WHERE question_id=?", (qid,))
     opts = [o[0] for o in sql.fetchall()]
 
-    # HIMOYA
-    if len(opts) < 4:
-        u["index"] += 1
-        send_question(uid)
-        return
+    # 🔀 VARIANTLARNI ARALASHTIRISH
+    combined = list(enumerate(opts))
+    random.shuffle(combined)
 
-    bot.send_poll(
+    shuffled_opts = [o for _, o in combined]
+    new_correct = [i for i, (idx, _) in enumerate(combined) if idx == correct][0]
+
+    msg = bot.send_poll(
         uid,
         text,
-        opts[:4],
+        shuffled_opts[:4],
         type="quiz",
-        correct_option_id=correct,
-        is_anonymous=False
+        correct_option_id=new_correct,
+        is_anonymous=False,
+        open_period=QUESTION_TIME  # ⏱ VAQT
     )
 
-    u["index"] += 1
+    u["polls"][msg.poll.id] = new_correct
 
-# ================= SCORE =================
+# ================= POLL ANSWER =================
 @bot.poll_answer_handler()
 def handle_poll_answer(poll):
     uid = poll.user.id
@@ -215,21 +206,15 @@ def handle_poll_answer(poll):
         return
 
     u = users[uid]
-
-    poll_id = poll.poll_id
-    chosen = poll.option_ids[0]
-
-    correct = u.get("polls", {}).get(poll_id)
+    correct = u["polls"].get(poll.poll_id)
     if correct is None:
         return
 
-    if chosen == correct:
+    if poll.option_ids[0] == correct:
         u["score"] += 1
 
-    # 🔴 MUHIM: keyingi savolga o‘tamiz
     u["index"] += 1
     send_question(uid)
-
 
 # ================= FINISH =================
 def finish(uid):
@@ -244,49 +229,41 @@ def finish(uid):
     percent = int(u["score"] / u["index"] * 100)
 
     kb = types.InlineKeyboardMarkup()
-    kb.add(types.InlineKeyboardButton("📊 Reyting jadvali", callback_data=f"rating_{u['test']}"))
+    kb.add(types.InlineKeyboardButton("📊 Reyting", callback_data=f"rating_{u['test']}"))
 
     bot.send_message(
         uid,
         f"🏁 NATIJA\n\n"
-        f"🎯 Ball: {u['score']}/{u['index']}\n"
-        f"📊 Foiz: {percent}%\n"
-        f"🏆 Baho: {'A' if percent>=80 else 'B' if percent>=60 else 'C'}",
+        f"🎯 {u['score']}/{u['index']}\n"
+        f"📊 {percent}%",
         reply_markup=kb
     )
 
     del users[uid]
 
-# ================= LEADERBOARD =================
+# ================= RATING =================
 @bot.callback_query_handler(func=lambda c: c.data.startswith("rating_"))
 def rating(call):
     tid = int(call.data.split("_")[1])
 
     sql.execute("""
         SELECT username, score, total,
-               CAST(score * 100 / total AS INT) AS percent
+               CAST(score * 100 / total AS INT)
         FROM results
         WHERE test=?
-        ORDER BY percent DESC, score DESC
+        ORDER BY score DESC
         LIMIT 10
     """, (tid,))
     rows = sql.fetchall()
 
-    if not rows:
-        bot.send_message(call.message.chat.id, "📊 Reyting hali yo‘q")
-        return
-
     medals = ["🥇", "🥈", "🥉"]
-    text = "🏆 REYTING JADVALI (TOP 10)\n\n"
+    text = "🏆 REYTING JADVALI\n\n"
 
     for i, r in enumerate(rows):
         medal = medals[i] if i < 3 else f"{i+1}."
-        name, score, total, percent = r
-        text += f"{medal} 🧑‍🎓 {name}\n   🎯 {score}/{total} | 📊 {percent}%\n\n"
+        text += f"{medal} 🧑‍🎓 {r[0]} — {r[1]}/{r[2]} ({r[3]}%)\n"
 
     bot.send_message(call.message.chat.id, text)
 
 # ================= RUN =================
-bot.polling(none_stop=True, timeout=60, long_polling_timeout=60)
-
-
+bot.polling(none_stop=True)
