@@ -220,12 +220,16 @@ def handle_poll_answer(poll):
     chosen = poll.option_ids[0]
 
     correct = u.get("polls", {}).get(poll_id)
-
     if correct is None:
         return
 
     if chosen == correct:
         u["score"] += 1
+
+    # 🔴 MUHIM: keyingi savolga o‘tamiz
+    u["index"] += 1
+    send_question(uid)
+
 
 # ================= FINISH =================
 def finish(uid):
@@ -284,4 +288,5 @@ def rating(call):
 
 # ================= RUN =================
 bot.polling(none_stop=True, timeout=60, long_polling_timeout=60)
+
 
