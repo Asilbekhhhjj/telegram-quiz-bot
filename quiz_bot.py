@@ -1,240 +1,276 @@
 import telebot
 from telebot import types
-from docx import Document
+import sqlite3
 import os
-import random
-from datetime import datetime
+from PyPDF2 import PdfReader
 
-TOKEN = os.getenv("TELEGRAM_TOKEN")
-if not TOKEN:
-    raise SystemExit("TELEGRAM_TOKEN yo‘q")
-
+TOKEN = "8492824131:AAGnhTLsUbIfgxF9HpfB-zMxWQALLoKZ20Y"
 bot = telebot.TeleBot(TOKEN)
 
-# =========================
-# STATE STORAGE
-# =========================
+# ================= DATABASE =================
+db = sqlite3.connect("quiz.db", check_same_thread=False)
+sql = db.cursor()
+
+sql.executescript("""
+CREATE TABLE IF NOT EXISTS tests(
+ id INTEGER PRIMARY KEY AUTOINCREMENT,
+ title TEXT,
+ owner INTEGER
+);
+
+CREATE TABLE IF NOT EXISTS questions(
+ id INTEGER PRIMARY KEY AUTOINCREMENT,
+ test_id INTEGER,
+ text TEXT,
+ correct INTEGER
+);
+
+CREATE TABLE IF NOT EXISTS options(
+ id INTEGER PRIMARY KEY AUTOINCREMENT,
+ question_id INTEGER,
+ text TEXT
+);
+
+CREATE TABLE IF NOT EXISTS results(
+ user INTEGER,
+ username TEXT,
+ test INTEGER,
+ score INTEGER,
+ total INTEGER
+);
+""")
+db.commit()
+
 users = {}
 
-# =========================
-# HELPERS
-# =========================
-def reset_user(uid):
-    users[uid] = {
-        "stage": "title",
-        "title": "",
-        "questions": [],
-        "time": 10,
-        "shuffle_q": False,
-        "shuffle_a": False
-    }
-
-# =========================
-# START
-# =========================
+# ================= START =================
 @bot.message_handler(commands=["start"])
 def start(msg):
-    reset_user(msg.chat.id)
+    args = msg.text.split()
+
+    # link orqali test
+    if len(args) > 1 and args[1].startswith("test_"):
+        start_test(msg.chat.id, msg.from_user, int(args[1].split("_")[1]))
+        return
+
+    users[msg.chat.id] = {"stage": "title"}
     bot.send_message(
         msg.chat.id,
-        "📝 Keling, yangi test tuzamiz.\n"
-        "Iltimos, test sarlavhasini yuboring."
+        "📝 Test nomini yuboring:\n"
+        "❗ Keyingi bosqichda PDF yuklaysiz"
     )
 
-# =========================
-# TEXT HANDLER (STATE BASED)
-# =========================
+# ================= TEXT =================
 @bot.message_handler(content_types=["text"])
 def text_handler(msg):
-    u = users.get(msg.chat.id)
-    if not u:
+    uid = msg.chat.id
+    if uid not in users:
         return
 
-    # 1️⃣ TITLE
-    if u["stage"] == "title":
-        u["title"] = msg.text
-        u["stage"] = "method"
+    u = users[uid]
 
-        kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
-        kb.add("📝 Qo‘lda kiritish", "📄 Word fayl yuborish")
+    if u["stage"] == "title":
+        sql.execute("INSERT INTO tests(title,owner) VALUES(?,?)", (msg.text, uid))
+        db.commit()
+        u["test_id"] = sql.lastrowid
+        u["stage"] = "pdf"
 
         bot.send_message(
-            msg.chat.id,
-            "Test qanday kiritiladi?",
-            reply_markup=kb
+            uid,
+            "📄 Endi PDF faylni yuboring\n"
+            "❗ Har savolda A–D va bitta * bo‘lishi shart"
         )
 
-    # 3️⃣ MANUAL QUESTION
-    elif u["stage"] == "manual_question":
-        u["current_q"] = msg.text
-        u["current_opts"] = []
-        u["stage"] = "manual_opts"
-        bot.send_message(msg.chat.id, "Variantlarni yuboring (A;B;C;D):")
-
-    elif u["stage"] == "manual_opts":
-        opts = msg.text.split(";")
-        if len(opts) < 2:
-            bot.send_message(msg.chat.id, "Kamida 2 ta variant kerak.")
-            return
-        u["current_opts"] = opts
-        u["stage"] = "manual_correct"
-        bot.send_message(msg.chat.id, "To‘g‘ri javob raqamini yuboring (1-4):")
-
-    elif u["stage"] == "manual_correct":
-        idx = int(msg.text) - 1
-        q = {
-            "q": u["current_q"],
-            "opts": u["current_opts"],
-            "ans": idx
-        }
-        u["questions"].append(q)
-
-        kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
-        kb.add("➕ Yana savol", "▶️ Davom etish")
-        u["stage"] = "after_manual"
-
-        bot.send_message(msg.chat.id, "Savol qo‘shildi", reply_markup=kb)
-
-# =========================
-# BUTTON HANDLER
-# =========================
-@bot.message_handler(func=lambda m: True)
-def buttons(msg):
-    u = users.get(msg.chat.id)
-    if not u:
-        return
-
-    # 2️⃣ METHOD
-    if msg.text == "📄 Word fayl yuborish":
-        u["stage"] = "word"
-        bot.send_message(msg.chat.id, "Word (.docx) fayl yuboring")
-        return
-
-    if msg.text == "📝 Qo‘lda kiritish":
-        u["stage"] = "manual_question"
-        bot.send_message(msg.chat.id, "Savolni yuboring:")
-        return
-
-    if msg.text == "➕ Yana savol":
-        u["stage"] = "manual_question"
-        bot.send_message(msg.chat.id, "Keyingi savolni yuboring:")
-        return
-
-    if msg.text == "▶️ Davom etish":
-        ask_time(msg.chat.id)
-        return
-
-# =========================
-# WORD UPLOAD
-# =========================
+# ================= PDF LOADER =================
 @bot.message_handler(content_types=["document"])
-def load_word(msg):
-    u = users.get(msg.chat.id)
-    if not u or u["stage"] != "word":
+def load_pdf(msg):
+    uid = msg.chat.id
+    if uid not in users or users[uid]["stage"] != "pdf":
         return
 
-    file_info = bot.get_file(msg.document.file_id)
-    data = bot.download_file(file_info.file_path)
+    file = bot.get_file(msg.document.file_id)
+    data = bot.download_file(file.file_path)
 
-    fname = "temp.docx"
-    with open(fname, "wb") as f:
+    with open("temp.pdf", "wb") as f:
         f.write(data)
 
-    doc = Document(fname)
-    os.remove(fname)
+    reader = PdfReader("temp.pdf")
+    os.remove("temp.pdf")
 
-    q = None
-    for p in doc.paragraphs:
-        t = p.text.strip()
-        if not t:
-            continue
+    full_text = ""
+    for page in reader.pages:
+        text = page.extract_text()
+        if text:
+            full_text += text + "\n"
+
+    lines = [l.strip() for l in full_text.splitlines() if l.strip()]
+
+    test_id = users[uid]["test_id"]
+    saved = 0
+
+    q_text = None
+    opts = []
+    correct = None
+
+    for t in lines:
+        # SAVOL
         if t[0].isdigit():
-            if q:
-                u["questions"].append(q)
-            q = {"q": t, "opts": [], "ans": 0}
-        elif t.startswith(("A)", "B)", "C)", "D)")):
+            q_text = t
+            opts = []
+            correct = None
+
+        # VARIANTLAR
+        elif t[:2] in ("A)", "B)", "C)", "D)"):
             if "*" in t:
-                q["ans"] = len(q["opts"])
+                correct = len(opts)
                 t = t.replace("*", "")
-            q["opts"].append(t[3:])
-    if q:
-        u["questions"].append(q)
+            opts.append(t[3:].strip())
 
-    ask_time(msg.chat.id)
+        # SAQLASH SHARTI
+        if q_text and correct is not None and len(opts) >= 4:
+            sql.execute(
+                "INSERT INTO questions(test_id,text,correct) VALUES(?,?,?)",
+                (test_id, q_text, correct)
+            )
+            qid = sql.lastrowid
 
-# =========================
-# TIME
-# =========================
-def ask_time(chat_id):
-    kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
-    kb.add("10", "15", "30", "60")
-    users[chat_id]["stage"] = "time"
-    bot.send_message(chat_id, "Har savol uchun vaqt (soniya):", reply_markup=kb)
+            for o in opts[:4]:
+                sql.execute(
+                    "INSERT INTO options(question_id,text) VALUES(?,?)",
+                    (qid, o)
+                )
 
-@bot.message_handler(func=lambda m: m.text.isdigit())
-def set_time(msg):
-    u = users.get(msg.chat.id)
-    if not u or u["stage"] != "time":
+            db.commit()
+            saved += 1
+            q_text = None
+
+    link = f"https://t.me/{bot.get_me().username}?start=test_{test_id}"
+
+    bot.send_message(
+        uid,
+        f"✅ PDF yuklandi\n"
+        f"📌 Saqlangan savollar: {saved}\n"
+        f"🔗 Test link:\n{link}"
+    )
+
+    del users[uid]
+
+# ================= START TEST =================
+def start_test(uid, user, tid):
+    sql.execute("SELECT title FROM tests WHERE id=?", (tid,))
+    t = sql.fetchone()
+    if not t:
+        bot.send_message(uid, "❌ Test topilmadi")
         return
 
-    u["time"] = int(msg.text)
-    ask_shuffle(msg.chat.id)
+    users[uid] = {
+        "test": tid,
+        "index": 0,
+        "score": 0,
+        "username": user.username or user.first_name
+    }
 
-# =========================
-# SHUFFLE
-# =========================
-def ask_shuffle(chat_id):
-    kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
-    kb.add("🔀 Barchasi", "❓ Faqat savollar", "🅰️ Faqat javoblar", "🚫 Aralashtirmaslik")
-    users[chat_id]["stage"] = "shuffle"
-    bot.send_message(chat_id, "Aralashtirish:", reply_markup=kb)
+    bot.send_message(uid, f"🧠 Test: {t[0]}")
+    send_question(uid)
 
-@bot.message_handler(func=lambda m: m.text.startswith(("🔀", "❓", "🅰️", "🚫")))
-def set_shuffle(msg):
-    u = users.get(msg.chat.id)
-    if not u:
+def send_question(uid):
+    u = users[uid]
+
+    sql.execute(
+        "SELECT id,text,correct FROM questions WHERE test_id=? LIMIT 1 OFFSET ?",
+        (u["test"], u["index"])
+    )
+    q = sql.fetchone()
+
+    if not q:
+        finish(uid)
         return
 
-    if "Barchasi" in msg.text:
-        u["shuffle_q"] = u["shuffle_a"] = True
-    elif "Faqat savollar" in msg.text:
-        u["shuffle_q"] = True
-    elif "Faqat javoblar" in msg.text:
-        u["shuffle_a"] = True
+    qid, text, correct = q
+    sql.execute("SELECT text FROM options WHERE question_id=?", (qid,))
+    opts = [o[0] for o in sql.fetchall()]
 
-    launch_quiz(msg.chat.id)
+    # HIMOYA
+    if len(opts) < 4:
+        u["index"] += 1
+        send_question(uid)
+        return
 
-# =========================
-# QUIZ
-# =========================
-def launch_quiz(chat_id):
-    u = users[chat_id]
+    bot.send_poll(
+        uid,
+        text,
+        opts[:4],
+        type="quiz",
+        correct_option_id=correct,
+        is_anonymous=False
+    )
 
-    qs = u["questions"].copy()
-    if u["shuffle_q"]:
-        random.shuffle(qs)
+    u["index"] += 1
 
-    for q in qs:
-        opts = q["opts"].copy()
-        correct = q["ans"]
+# ================= SCORE =================
+@bot.poll_answer_handler()
+def handle_poll_answer(poll):
+    uid = poll.user.id
+    if uid not in users:
+        return
 
-        if u["shuffle_a"]:
-            combined = list(enumerate(opts))
-            random.shuffle(combined)
-            opts = [o for _, o in combined]
-            correct = [i for i, (idx, _) in enumerate(combined) if idx == q["ans"]][0]
+    if poll.option_ids[0] == poll.correct_option_id:
+        users[uid]["score"] += 1
 
-        bot.send_poll(
-            chat_id,
-            question=q["q"],
-            options=opts,
-            type="quiz",
-            correct_option_id=correct,
-            open_period=u["time"],
-            is_anonymous=False
-        )
+# ================= FINISH =================
+def finish(uid):
+    u = users[uid]
 
-    bot.send_message(chat_id, "🏁 Test yakunlandi")
+    sql.execute(
+        "INSERT INTO results VALUES(?,?,?,?,?)",
+        (uid, u["username"], u["test"], u["score"], u["index"])
+    )
+    db.commit()
 
-# =========================
-bot.polling()
+    percent = int(u["score"] / u["index"] * 100)
+
+    kb = types.InlineKeyboardMarkup()
+    kb.add(types.InlineKeyboardButton("📊 Reyting jadvali", callback_data=f"rating_{u['test']}"))
+
+    bot.send_message(
+        uid,
+        f"🏁 NATIJA\n\n"
+        f"🎯 Ball: {u['score']}/{u['index']}\n"
+        f"📊 Foiz: {percent}%\n"
+        f"🏆 Baho: {'A' if percent>=80 else 'B' if percent>=60 else 'C'}",
+        reply_markup=kb
+    )
+
+    del users[uid]
+
+# ================= LEADERBOARD =================
+@bot.callback_query_handler(func=lambda c: c.data.startswith("rating_"))
+def rating(call):
+    tid = int(call.data.split("_")[1])
+
+    sql.execute("""
+        SELECT username, score, total,
+               CAST(score * 100 / total AS INT) AS percent
+        FROM results
+        WHERE test=?
+        ORDER BY percent DESC, score DESC
+        LIMIT 10
+    """, (tid,))
+    rows = sql.fetchall()
+
+    if not rows:
+        bot.send_message(call.message.chat.id, "📊 Reyting hali yo‘q")
+        return
+
+    medals = ["🥇", "🥈", "🥉"]
+    text = "🏆 REYTING JADVALI (TOP 10)\n\n"
+
+    for i, r in enumerate(rows):
+        medal = medals[i] if i < 3 else f"{i+1}."
+        name, score, total, percent = r
+        text += f"{medal} 🧑‍🎓 {name}\n   🎯 {score}/{total} | 📊 {percent}%\n\n"
+
+    bot.send_message(call.message.chat.id, text)
+
+# ================= RUN =================
+bot.polling(none_stop=True, timeout=60, long_polling_timeout=60)
